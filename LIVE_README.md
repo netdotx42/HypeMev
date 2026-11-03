@@ -12,11 +12,11 @@ npm test
 npm run typecheck
 ```
 
-Edit `.env` locally. Use a dedicated funded master account with **standard separate spot/perp balances** (`userAbstraction=disabled`). Other abstraction modes are rejected. Entry requires no HYPE inventory, no native perpetual positions, no open orders, and no nonzero spot assets apart from USDC. HIP-3 positions are outside this bot's checks; use an otherwise empty account. Do not trade manually, run another bot, deposit or withdraw while this bot manages a cycle.
+Edit `.env` locally. Use a dedicated funded master account with **separate spot and perp balances**. `userAbstraction` must be `disabled` or `default` (an account that has never changed mode). Unified, portfolio-margin, and dex-abstraction modes are rejected because spot balances would be mixed into perp equity. Entry requires no HYPE inventory, no native perpetual positions, no open orders (including triggers), and no nonzero spot assets apart from USDC. Before entry, and about once a minute while a position is open, the bot also rejects positions or orders on builder-deployed perp dexs (HIP-3). Do not trade manually, run another bot, deposit or withdraw while this bot manages a cycle.
 
 Approve a **named API wallet** for this account in Hyperliquid's interface on the selected network. Put its key in `AGENT_PRIVATE_KEY` and the funded master address in `ACCOUNT_ADDRESS`. The bot verifies the named agent's approval and expiration. It rejects a key matching the master address. It does not create/approve agents or transfer funds. Never paste keys into chat or commit `.env`.
 
-Fund spot USDC and perpetual margin separately. The bot requires free spot USDC >= 102% of the configured spot cap and withdrawable perpetual margin >= 110% of that cap. It sets HYPE to 1x cross leverage before entering. Testnet liquidity and markets may differ; missing HYPE markets cause a clean halt.
+Fund spot USDC and perpetual margin separately. With separate balances, HYPE you buy does **not** collateralize the short. A rally can liquidate the perp while the spot leg is still a gain in the other wallet. The bot requires free spot USDC >= 102% of the configured spot cap and withdrawable perpetual margin >= 110% of that cap, sets HYPE to 1x cross, and reads the account back to confirm that leverage before it enters. While open, it exits if the mark gets within `LIQ_BUFFER_BPS` of the exchange liquidation price. That is an attempt, not a guarantee. Testnet liquidity and markets may differ; missing HYPE markets cause a clean halt.
 
 ## Run
 
@@ -32,7 +32,7 @@ Set `LIVE_TRADING=true` for signed testnet orders, then:
 npm run live
 ```
 
-For real funds, set `NETWORK=mainnet`, configure the approved mainnet API agent and funded master account, and choose your limits in `.env`. `npm run live` can then submit real orders without another prompt. No live trades were submitted while building this package.
+For real funds, set `NETWORK=mainnet` and `CONFIRM_MAINNET=true`, configure the approved mainnet API agent and funded master account, and choose your limits in `.env`. Both flags are required before a mainnet order is signed. `npm run check` stays read-only on either network. No live trades were submitted while building this package.
 
 Close using the original journal:
 
@@ -55,10 +55,13 @@ Entry checks book age, depth, timestamp skew, size/price precision, cash, margin
 | `NOTIONAL_USDC` | 25 | Spot purchase cap before fees for this cycle |
 | `MAX_NOTIONAL_USDC` | 50 | Configuration ceiling for the spot cap, maximum supported 1,000 |
 | `MIN_NET_BPS` | 30 | Required estimated convergence edge after costs |
-| `SLIPPAGE_BPS` | 10 | IOC distance from best bid/ask, rounded inward |
+| `CONFIRM_MAINNET` | false | Required as well as `LIVE_TRADING=true` before mainnet orders |
+| `SLIPPAGE_BPS` | 10 | Entry IOC distance from best bid/ask, rounded inward to a legal tick |
+| `EXIT_SLIPPAGE_BPS` | 50 | Wider IOC distance used only for closes and unwinds |
 | `EXIT_BUFFER_BPS` | 15 | Extra allowance for exit costs in entry estimate |
 | `EXIT_BASIS_BPS` | 5 | Close when executable perp-buy minus spot-sell spread reaches threshold |
-| `MAX_LOSS_USDC` | 2 | Exit trigger for estimated net liquidation loss |
+| `LIQ_BUFFER_BPS` | 1000 | Exit when mark is this close to the short's liquidation price |
+| `MAX_LOSS_USDC` | 2 | Exit trigger for estimated loss at executable close prices inside the exit limit |
 | `MAX_HOLD_SECONDS` | 3600 | Maximum holding time before an exit attempt |
 | `POLL_MS` | 5000 | Poll interval, minimum 2 seconds |
 | `STATE_FILE` | account/network filename | Optional absolute journal path in a private durable directory |
@@ -71,22 +74,25 @@ Ctrl+C or SIGTERM requests a close. A second signal, SIGKILL, host crash or lost
 
 Orders have unique client IDs and five-second server expirations. The full intent is fsynced to a private journal before submission. A lock blocks simultaneous use of that same journal; it does not coordinate other journals or hosts. Run only one instance per account/API wallet.
 
-- Partial spot fills are hedged using net acquired inventory.
+- A spot IOC that fills nothing leaves the journal flat so a later poll can try again. Any purchased inventory that cannot be hedged is sold back.
+- Partial spot fills are hedged using net acquired inventory. The hedge limit keeps the more conservative of the pre-entry and refreshed sell floors, without reformatting that price.
 - Partial/rejected hedges trigger a full unwind attempt after account reconciliation.
-- Closing covers the short with a reduce-only order before selling spot. A partial perp close halts before selling spot.
+- Closing covers the short with a reduce-only order before selling spot. A partial perp close halts before selling spot. Exit orders use the wider slippage cap and are still sent when the visible book is thinner than the position; entry orders are not.
+- A balance read that fails before an order is sent does not change an `open` journal into `closing`.
+- While flat or open, stale books and transport errors are retried with backoff. A pending order, or an `opening` / `closing` journal, is never retried in place.
 - A timeout preserves a pending intent and halts. No ambiguous write is blindly retried.
 - Run `npm run close` with the same account, network and journal after a failure. Pending orders must expire and have a known terminal `orderStatus` before more orders are allowed. Recovery closes exposure; it does not re-enter.
 - Unknown/nonterminal order status, inconsistent balances, unavailable depth, API errors or rejected closes halt recovery. Inspect the exchange account and journal/client ID. Resolve/cancel orders and manage exposure through Hyperliquid's interface if needed. Never delete the journal to bypass reconciliation.
 - After a crash, remove a stale `.lock` only after verifying the original process is no longer running. Keep the journal.
 - Dust below the spot lot step can remain and is recorded. Minimum order values may prevent small residual sales; handle these manually. Failed closes remain in `closing` rather than being marked complete.
 
-Monitoring errors halt and may leave a position open. Restore connectivity and use `npm run live` to resume a known open position or `npm run close` to unwind. There are no automatic restarts. Store the journal durably; losing it removes automatic recovery context.
+Read failures while flat or open are retried with backoff. They are not orders. A pending order, a half-finished entry, or a close that has already started still stops the process and can leave a position open. Restore connectivity and use `npm run live` to resume a known open position or `npm run close` to unwind. There are no automatic process restarts. Store the journal durably; losing it removes automatic recovery context.
 
 ## Verification
 
-Tests cover calculations, order sequencing, cash/notional/edge guards, partial spot and hedge fills, hedge rejection, timeout/restart recovery without duplicates, unknown status, stale account reconciliation, partial closes, price/size formatting, journal round trips, and the disabled-live CLI guard. Run `npm test` and `npm run typecheck`.
+Tests cover calculations, order sequencing, cash/notional/edge guards, partial spot and hedge fills, hedge rejection, a missed entry that stays flat, timeout/restart recovery without duplicates, unknown and rejected order statuses, stale account reconciliation, partial closes, tick/lot formatting, journal round trips, liquidation and stop decisions, and the live-trading and mainnet CLI guards. Run `npm test` and `npm run typecheck`.
 
-All 18 automated tests and the TypeScript check passed in the build environment. The SDK signing path is tested with a generated ephemeral key and mocked transport; no signed request is sent to an exchange by the tests. Public mainnet metadata access succeeded, although repeated API calls intermittently timed out. The live path has not been tested with a funded exchange account. Test the full lifecycle on testnet before using funds. This implementation has simulated exchange tests, not a production trading audit.
+The SDK signing path is tested with a generated ephemeral key and mocked transport; no signed request is sent to an exchange by the tests. The live path has not been tested with a funded exchange account. Test the full lifecycle on testnet before using funds. This implementation has simulated exchange tests, not a production trading audit.
 
 ## Primary references
 

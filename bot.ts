@@ -18,6 +18,14 @@ function setting(name: string, fallback: number, min: number): number {
   if (!Number.isFinite(n) || n < min) throw new Error(`Invalid ${name}`);
   return n;
 }
+export function touch(levels: Level[], side: 'buy' | 'sell'): number {
+  const prices = levels.map(l => ({ px: Number(l.px), sz: Number(l.sz) }));
+  if (prices.some(l => !Number.isFinite(l.px) || !Number.isFinite(l.sz) || l.px <= 0 || l.sz < 0))
+    throw new Error('Invalid order-book level');
+  const shown = prices.filter(l => l.sz > 0).map(l => l.px);
+  if (!shown.length) throw new Error('Insufficient displayed depth');
+  return side === 'buy' ? Math.min(...shown) : Math.max(...shown);
+}
 export function vwap(levels: Level[], quantity: number, side: 'buy' | 'sell'): number {
   if (!Number.isFinite(quantity) || quantity <= 0) throw new Error('Invalid quantity');
   const rows = levels.map(l => ({ px: Number(l.px), sz: Number(l.sz) }));
@@ -90,7 +98,7 @@ async function main() {
         info<Book>({ type: 'l2Book', coin: spotCoin }),
         info<Book>({ type: 'l2Book', coin: asset })]);
       if (spot.coin !== spotCoin || future.coin !== asset) throw new Error('Unexpected book market');
-      const bestAsk = Math.min(...spot.levels[1].map(l => Number(l.px)));
+      const bestAsk = touch(spot.levels[1], 'buy');
       let quantity = Math.floor(budget / bestAsk * 10 ** decimals) / 10 ** decimals;
       // Reduce quantity if walking depth takes the spot purchase above the budget.
       for (let attempt = 0; attempt < 10; attempt++) {
