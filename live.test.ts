@@ -1,0 +1,166 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { ExchangeClient, HttpTransport } from '@nktkas/hyperliquid';
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
+import { Engine, down, limitPrice, selectHypePair } from './live-core.ts';
+import type { Order, Port, Snapshot, State } from './live-core.ts';
+import { saveJournal } from './live.ts';
+const costs = { minNetBps: 30, spotFeeBps: 10, perpFeeBps: 5, exitBufferBps: 15 };
+function fixture() {
+  const state: State = { version: 1, network: 'testnet', user: '0xaccount', market: {
+    spotId: 10107, perpId: 5, spotCoin: '@107', token: 150, spotDecimals: 2, perpDecimals: 2 },
+    phase: 'flat', entryEquity: 0, startedAt: 0, events: [] };
+  const account: Snapshot = { spot: 0, spotFree: 0, cash: 100, perp: 0, equity: 200,
+    marginFree: 100, perpMark: 102, openOrders: 0, otherPositions: false };
+  const orders: Order[] = [];
+  const saved: State[] = [];
+  const port: Port = {
+    snapshot: async () => ({ ...account }),
+    quote: async (spot, buy) => ({ vwap: spot ? 100 : 102,
+      limit: spot ? (buy ? '100.1' : '99.9') : (buy ? '102.1' : '101.9'), at: Date.now() }),
+    save: s => { saved.push(structuredClone(s)); },
+    status: async () => 'filled',
+    submit: async (o) => {
+      // Verify durable intent exists before a signed request is made.
+      assert.equal(saved.at(-1)?.pending?.order.c, o.c);
+      orders.push(o);
+      const size = Number(o.s);
+      if (o.a === state.market.spotId) {
+        account.spot += o.b ? size : -size; account.spotFree = account.spot;
+      } else account.perp += o.b ? size : -size;
+      return { filledSize: size, avgPx: o.a === state.market.spotId ? 100 : 102 };
+    }
+  };
+  return { state, account, orders, saved, port, engine: new Engine(port, state) };
+}
+test('entry then close: spot buy, perp short, reduce-only cover, spot sell', async () => {
+  const f = fixture();
+  await f.engine.enter(0.2, 25, costs);
+  assert.equal(f.state.phase, 'open'); assert.equal(f.account.perp, -0.2);
+  await f.engine.close(); assert.equal(f.state.phase, 'closed');
+  assert.deepEqual(f.orders.map(o => [o.a, o.b, o.r]),
+    [[10107, true, false], [5, false, false], [5, true, true], [10107, false, false]]);
+  await assert.rejects(() => f.engine.enter(0.2, 25, costs), /One position/);
+});
+test('no order when cash, worst-case notional, or net edge fails', async () => {
+  const f = fixture(); f.account.cash = 1;
+  await assert.rejects(() => f.engine.enter(0.2, 25, costs), /guard/);
+  f.account.cash = 100;
+  await assert.rejects(() => f.engine.enter(0.3, 25, costs), /guard/);
+  await assert.rejects(() => f.engine.enter(0.2, 25, { ...costs, minNetBps: 300 }), /edge/);
+  assert.equal(f.orders.length, 0);
+});
+test('partial spot fill hedges actual inventory', async () => {
+  const f = fixture(), original = f.port.submit;
+  f.port.submit = async (o, t) => original(o.a === 10107 && o.b ? { ...o, s: '0.10' } : o, t);
+  await f.engine.enter(0.2, 25, costs);
+  assert.equal(f.orders[1]?.s, '0.10'); assert.equal(f.state.phase, 'open');
+});
+test('partial hedge triggers full unwind', async () => {
+  const f = fixture(), original = f.port.submit;
+  f.port.submit = async (o, t) => original(o.a === 5 && !o.b ? { ...o, s: '0.10' } : o, t);
+  await f.engine.enter(0.2, 25, costs);
+  assert.equal(f.state.phase, 'closed'); assert.equal(f.account.perp, 0); assert.equal(f.account.spot, 0);
+});
+test('explicit zero-fill hedge rejection unwinds purchased spot', async () => {
+  const f = fixture(), original = f.port.submit;
+  f.port.submit = async (o, t) => o.a === 5 && !o.b ? { filledSize: 0, avgPx: 0 } : original(o, t);
+  await f.engine.enter(0.2, 25, costs);
+  assert.equal(f.state.phase, 'closed'); assert.equal(f.account.spot, 0);
+});
+test('timeout after accepted spot order persists pending and forbids retry', async () => {
+  const f = fixture(), original = f.port.submit;
+  f.port.submit = async (o, t) => { await original(o, t); throw new Error('timeout'); };
+  await assert.rejects(() => f.engine.enter(0.2, 25, costs), /timeout/);
+  assert.equal(f.account.spot, 0.2); assert.ok(f.state.pending);
+  await assert.rejects(() => f.engine.close(), /Reconcile/);
+  assert.equal(f.orders.length, 1);
+  f.state.pending!.expiresAt = Date.now() - 3000;
+  f.port.submit = original;
+  const restarted = new Engine(f.port, structuredClone(f.state));
+  await restarted.reconcilePending(); await restarted.close();
+  assert.equal(f.orders.filter(o => o.a === 10107 && o.b).length, 1);
+  assert.equal(restarted.state.phase, 'closed');
+});
+test('unknown order status blocks recovery', async () => {
+  const f = fixture();
+  f.state.pending = { order: { a: 5, b: false, p: '100', s: '0.2', r: false,
+    t: { limit: { tif: 'Ioc' } }, c: '0x00000000000000000000000000000001' }, expiresAt: 0 };
+  f.port.status = async () => 'unknownOid';
+  await assert.rejects(() => f.engine.reconcilePending(), /Unresolved/);
+  assert.ok(f.state.pending); assert.equal(f.orders.length, 0);
+});
+test('inconsistent fill/account snapshot halts without selling spot or duplicating hedge', async () => {
+  const f = fixture(), original = f.port.submit;
+  f.port.submit = async (o, t) => {
+    const result = await original(o, t);
+    if (o.a === 5 && !o.b) f.account.perp = 0; // stale account view
+    return result;
+  };
+  await assert.rejects(() => f.engine.enter(0.2, 25, costs), /not reconciled/);
+  assert.equal(f.orders.length, 2); assert.equal(f.state.phase, 'opening');
+});
+test('partial perp close does not sell spot; a later close resumes from balances', async () => {
+  const f = fixture(), original = f.port.submit;
+  await f.engine.enter(0.2, 25, costs);
+  f.port.submit = async (o, t) => original(o.a === 5 && o.b ? { ...o, s: '0.10' } : o, t);
+  await assert.rejects(() => f.engine.close(), /incomplete/);
+  assert.equal(f.account.spot, 0.2); assert.equal(f.state.phase, 'closing');
+  f.port.submit = original; await f.engine.close();
+  assert.equal(f.state.phase, 'closed');
+});
+test('price/size formatting stays inside slippage limits', () => {
+  assert.equal(down(1.2399, 2), 1.23);
+  for (const p of [0.000123456, 0.123456, 12.3456, 999.999, 123456.78]) {
+    assert.ok(Number(limitPrice(p, 2, true, true)) <= p + 1e-12);
+    assert.ok(Number(limitPrice(p, 2, true, false)) >= p - 1e-12);
+  }
+});
+test('journal round trip preserves pending client order ID and phase', () => {
+  const f = fixture(); const dir = mkdtempSync(join(tmpdir(), 'hl-journal-'));
+  try {
+    f.state.phase = 'opening';
+    const file = join(dir, 'state.json'); saveJournal(file, f.state);
+    assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), f.state);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+test('CLI live command fails before network access unless explicitly enabled', () => {
+  const result = spawnSync(process.execPath, ['live.ts', '--run'], {
+    cwd: new URL('.', import.meta.url), env: { ...process.env, LIVE_TRADING: 'false' }, encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Set LIVE_TRADING=true/);
+});
+test('SDK signs an IOC with client ID and server expiry using a mocked transport', async () => {
+  const wallet = privateKeyToAccount(generatePrivateKey());
+  const transport = new HttpTransport({ isTestnet: true });
+  const expiresAfter = Date.now() + 5000;
+  const order: Order = { a: 5, b: false, p: '100', s: '0.2', r: false,
+    t: { limit: { tif: 'Ioc' } }, c: '0x00000000000000000000000000000001' };
+  let called = false;
+  transport.request = async <T>(endpoint: string, payload: unknown): Promise<T> => {
+    called = true; assert.equal(endpoint, 'exchange');
+    const signed = payload as { action: { type: string; orders: Order[] }; expiresAfter: number;
+      signature: { r: string; s: string; v: number } };
+    assert.equal(signed.action.type, 'order'); assert.deepEqual(signed.action.orders, [order]);
+    assert.equal(signed.expiresAfter, expiresAfter); assert.match(signed.signature.r, /^0x[0-9a-f]{64}$/);
+    return { status: 'ok', response: { type: 'order', data: { statuses: [
+      { filled: { totalSz: '0.2', avgPx: '100', oid: 123 } }] } } } as T;
+  };
+  const exchange = new ExchangeClient({ transport, wallet });
+  const result = await exchange.order({ orders: [order], grouping: 'na' }, { expiresAfter });
+  assert.equal(result.status, 'ok'); assert.equal(called, true);
+});
+test('discovers noncanonical HYPE/USDC and rejects ambiguous markets or wrong token identity', () => {
+  const meta = { tokens: [
+    { name: 'HYPE', index: 150, szDecimals: 2, tokenId: '0x123', isCanonical: false },
+    { name: 'USDC', index: 0, szDecimals: 8, tokenId: '0x456', isCanonical: true }],
+    universe: [{ name: '@107', index: 107, tokens: [150, 0], isCanonical: false }] };
+  assert.equal(selectHypePair(meta, '0x123').pair.index, 107);
+  assert.throws(() => selectHypePair(meta, '0x999'), /uniquely/);
+  meta.universe.push({ ...meta.universe[0]!, index: 108 });
+  assert.throws(() => selectHypePair(meta), /uniquely/);
+});
