@@ -6,7 +6,9 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { ExchangeClient, HttpTransport } from '@nktkas/hyperliquid';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import { Engine, down, limitPrice, selectHypePair } from './live-core.ts';
+import { BotError, Engine, closePnl, down, exitReason, higherLimit, limitPrice, liquidationDistanceBps,
+  mustHaltAfterError, retryableReadError, selectHypePair, standardAbstraction, terminalOrderStatus,
+  wireSize } from './live-core.ts';
 import type { Order, Port, Snapshot, State } from './live-core.ts';
 import { saveJournal } from './live.ts';
 const costs = { minNetBps: 30, spotFeeBps: 10, perpFeeBps: 5, exitBufferBps: 15 };
@@ -14,8 +16,9 @@ function fixture() {
   const state: State = { version: 1, network: 'testnet', user: '0xaccount', market: {
     spotId: 10107, perpId: 5, spotCoin: '@107', token: 150, spotDecimals: 2, perpDecimals: 2 },
     phase: 'flat', entryEquity: 0, startedAt: 0, events: [] };
-  const account: Snapshot = { spot: 0, spotFree: 0, cash: 100, perp: 0, equity: 200,
-    marginFree: 100, perpMark: 102, openOrders: 0, otherPositions: false };
+  const account: Snapshot = { spot: 0, spotFree: 0, cash: 100, spotUsdc: 100, perp: 0,
+    perpEquity: 100, equity: 200, marginFree: 100, perpMark: 102, liquidationPx: null,
+    openOrders: 0, otherPositions: false };
   const orders: Order[] = [];
   const saved: State[] = [];
   const port: Port = {
@@ -58,7 +61,7 @@ test('partial spot fill hedges actual inventory', async () => {
   const f = fixture(), original = f.port.submit;
   f.port.submit = async (o, t) => original(o.a === 10107 && o.b ? { ...o, s: '0.10' } : o, t);
   await f.engine.enter(0.2, 25, costs);
-  assert.equal(f.orders[1]?.s, '0.10'); assert.equal(f.state.phase, 'open');
+  assert.equal(f.orders[1]?.s, '0.1'); assert.equal(f.state.phase, 'open');
 });
 test('partial hedge triggers full unwind', async () => {
   const f = fixture(), original = f.port.submit;
@@ -113,12 +116,31 @@ test('partial perp close does not sell spot; a later close resumes from balances
   f.port.submit = original; await f.engine.close();
   assert.equal(f.state.phase, 'closed');
 });
-test('price/size formatting stays inside slippage limits', () => {
+test('price/size formatting stays inside slippage limits and exchange tick rules', () => {
   assert.equal(down(1.2399, 2), 1.23);
+  assert.equal(wireSize(1.239, 2), '1.23');
+  assert.equal(wireSize(0.2, 2), '0.2');
   for (const p of [0.000123456, 0.123456, 12.3456, 999.999, 123456.78]) {
-    assert.ok(Number(limitPrice(p, 2, true, true)) <= p + 1e-12);
-    assert.ok(Number(limitPrice(p, 2, true, false)) >= p - 1e-12);
+    for (const buy of [true, false]) {
+      const wire = limitPrice(p, 2, true, buy);
+      assert.match(wire, /^[0-9]+(\.[0-9]*[1-9])?$/);
+      const n = Number(wire);
+      assert.ok(buy ? n <= p + 1e-9 : n >= p - 1e-9);
+      if (wire.includes('.')) {
+        const figures = wire.replace('.', '').replace(/^0+/, '').length;
+        assert.ok(figures <= 5);
+      }
+    }
   }
+  // Official examples: 1234.5 is valid and 1234.56 is not; integers above 1e5 are valid.
+  assert.equal(limitPrice(1234.56, 0, false, true), '1234.5');
+  assert.equal(limitPrice(1234.56, 0, false, false), '1234.6');
+  assert.equal(limitPrice(0.0012345, 0, false, true), '0.001234');
+  assert.equal(limitPrice(0.0012345, 0, false, false), '0.001235');
+  assert.equal(limitPrice(123456.7, 0, false, true), '123456');
+  assert.equal(limitPrice(123456.7, 0, false, false), '123457');
+  assert.equal(higherLimit('101.90', '101.8'), '101.90');
+  assert.equal(higherLimit('101.8', '102'), '102');
 });
 test('journal round trip preserves pending client order ID and phase', () => {
   const f = fixture(); const dir = mkdtempSync(join(tmpdir(), 'hl-journal-'));
@@ -128,11 +150,76 @@ test('journal round trip preserves pending client order ID and phase', () => {
     assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), f.state);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+test('a failed balance read does not mark an open position as closing', async () => {
+  const f = fixture();
+  await f.engine.enter(0.2, 25, costs);
+  f.port.snapshot = async () => { throw new BotError('Stale or invalid book'); };
+  await assert.rejects(() => f.engine.close(), /Stale/);
+  assert.equal(f.state.phase, 'open');
+  assert.equal(f.state.pending, undefined);
+});
+test('missed spot IOC stays flat and can be attempted again', async () => {
+  const f = fixture();
+  f.port.submit = async () => ({ filledSize: 0, avgPx: 0 });
+  await f.engine.enter(0.2, 25, costs);
+  assert.equal(f.state.phase, 'flat');
+  assert.equal(f.state.entryEquity, 0);
+  assert.equal(f.account.spot, 0);
+  assert.equal(f.state.pending, undefined);
+});
+test('positive fill without a price halts for reconciliation', async () => {
+  const f = fixture();
+  f.port.submit = async () => ({ filledSize: 0.2, avgPx: 0 });
+  await assert.rejects(() => f.engine.enter(0.2, 25, costs), /Invalid filled/);
+  assert.equal(f.state.phase, 'opening');
+  assert.ok(f.state.pending);
+});
+test('exit, liquidation, and recovery helpers', () => {
+  const base = { stopRequested: false, closeBasisBps: 20, exitBasisBps: 5, estimatedPnl: 1,
+    stopLoss: 2, heldMs: 0, maxHoldMs: 1000, liquidationDistanceBps: 5000, liqBufferBps: 1000 };
+  assert.equal(exitReason(base), null);
+  assert.equal(exitReason({ ...base, liquidationDistanceBps: 500 }), 'liquidation');
+  assert.equal(exitReason({ ...base, closeBasisBps: 5 }), 'basis');
+  assert.equal(exitReason({ ...base, estimatedPnl: -2 }), 'loss');
+  assert.equal(exitReason({ ...base, heldMs: 1000 }), 'hold');
+  assert.equal(exitReason({ ...base, stopRequested: true, closeBasisBps: 5 }), 'stop');
+  assert.equal(liquidationDistanceBps(100, 110), 1000);
+  assert.equal(liquidationDistanceBps(100, null), null);
+  const pnl = closePnl({ perpEquity: 100, spotUsdc: 75, spotQty: 0.25, spotExitPx: 100, perpQty: 0.25,
+    perpMark: 100, perpExitPx: 110, spotFeeBps: 0, perpFeeBps: 0, entryEquity: 200 });
+  assert.ok(Math.abs(pnl + 2.5) < 1e-9);
+  assert.equal(standardAbstraction('default'), true);
+  assert.equal(standardAbstraction('disabled'), true);
+  assert.equal(standardAbstraction('unifiedAccount'), false);
+  assert.equal(standardAbstraction('portfolioMargin'), false);
+  for (const status of ['filled', 'canceled', 'rejected', 'scheduledCancel', 'minTradeNtlRejected', 'iocCancelRejected'])
+    assert.equal(terminalOrderStatus(status), true);
+  assert.equal(terminalOrderStatus('open'), false);
+  assert.equal(terminalOrderStatus('triggered'), false);
+  assert.equal(terminalOrderStatus('unknownOid'), false);
+  const open = fixture().state;
+  open.phase = 'open';
+  assert.equal(mustHaltAfterError(open), false);
+  open.phase = 'closing';
+  assert.equal(mustHaltAfterError(open), true);
+  assert.equal(retryableReadError(new BotError('Stale or invalid book')), true);
+  assert.equal(retryableReadError(new BotError('Notional or cash/margin guard failed')), false);
+  assert.equal(retryableReadError(new Error('socket hang up')), true);
+});
 test('CLI live command fails before network access unless explicitly enabled', () => {
   const result = spawnSync(process.execPath, ['live.ts', '--run'], {
     cwd: new URL('.', import.meta.url), env: { ...process.env, LIVE_TRADING: 'false' }, encoding: 'utf8' });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /Set LIVE_TRADING=true/);
+});
+test('mainnet orders require a second explicit confirmation and do not reach the network', () => {
+  const result = spawnSync(process.execPath, ['live.ts', '--run'], {
+    cwd: new URL('.', import.meta.url),
+    env: { ...process.env, LIVE_TRADING: 'true', NETWORK: 'mainnet', CONFIRM_MAINNET: 'false' },
+    encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /CONFIRM_MAINNET=true/);
+  assert.equal(result.stdout, '');
 });
 test('SDK signs an IOC with client ID and server expiry using a mocked transport', async () => {
   const wallet = privateKeyToAccount(generatePrivateKey());

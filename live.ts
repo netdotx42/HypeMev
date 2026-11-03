@@ -4,9 +4,11 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { BotError, Engine, down, limitPrice, requireSnapshot, selectHypePair } from './live-core.ts';
-import type { Market, Order, Port, Snapshot, State } from './live-core.ts';
-import { vwap } from './bot.ts';
+import { BotError, Engine, closePnl, conservativeNetBps, down, exitReason, limitPrice,
+  liquidationDistanceBps, mustHaltAfterError, requireSnapshot, retryableReadError, selectHypePair,
+  standardAbstraction } from './live-core.ts';
+import type { Market, Order, Port, QuotePurpose, Snapshot, State } from './live-core.ts';
+import { touch, vwap } from './bot.ts';
 
 function num(name: string, fallback: number, min: number, max = Infinity) {
   const value = Number(process.env[name] ?? fallback);
@@ -33,6 +35,8 @@ async function main() {
     throw new BotError('Set LIVE_TRADING=true to enable signed orders');
   const network = process.env.NETWORK ?? 'testnet';
   if (!['mainnet', 'testnet'].includes(network)) throw new BotError('NETWORK must be mainnet or testnet');
+  if (network === 'mainnet' && command !== '--check' && process.env.CONFIRM_MAINNET !== 'true')
+    throw new BotError('Set CONFIRM_MAINNET=true to allow mainnet orders');
   const user = process.env.ACCOUNT_ADDRESS;
   if (!user || !/^0x[0-9a-fA-F]{40}$/.test(user)) throw new BotError('Set ACCOUNT_ADDRESS to the funded master account');
   const address = user as `0x${string}`;
@@ -43,14 +47,17 @@ async function main() {
   const minNetBps = num('MIN_NET_BPS', 30, 0, 10000);
   const exitBasisBps = num('EXIT_BASIS_BPS', 5, -10000, 10000);
   const slippageBps = num('SLIPPAGE_BPS', 10, 1, 100);
+  const exitSlippageBps = num('EXIT_SLIPPAGE_BPS', 50, 1, 500);
   const exitBufferBps = num('EXIT_BUFFER_BPS', 15, 0, 10000);
+  const liqBufferBps = num('LIQ_BUFFER_BPS', 1000, 0, 5000);
   const stopLoss = num('MAX_LOSS_USDC', 2, 0.01, 1000);
   const maxHold = num('MAX_HOLD_SECONDS', 3600, 10, 86400) * 1000;
   const poll = num('POLL_MS', 5000, 2000, 60000);
   const [spotMeta, meta, abstraction, fees] = await Promise.all([
     info.spotMeta(), info.meta(), info.userAbstraction({ user: address }), info.userFees({ user: address })]);
-  // Explicitly restrict this starter to separate spot/perp balances.
-  if (abstraction !== 'disabled') throw new BotError(`Unsupported account abstraction ${abstraction}; requires disabled/standard mode`);
+  // Unified and portfolio-margin modes pool balances, so the equity and margin checks would be wrong.
+  if (!standardAbstraction(abstraction))
+    throw new BotError(`Unsupported account abstraction ${abstraction}; requires default or disabled (separate spot and perp balances)`);
   // HYPE is marked isCanonical=false in spotMeta. Identify it by token ID on mainnet,
   // not the canonical flag; discover asset indices independently on each network.
   const { pair, token } = selectHypePair(spotMeta,
@@ -63,25 +70,36 @@ async function main() {
   const sharedDecimals = Math.min(market.spotDecimals, market.perpDecimals);
   const costs = { minNetBps, spotFeeBps: Math.max(0, n(fees.userSpotCrossRate) * 10000),
     perpFeeBps: Math.max(0, n(fees.userCrossRate) * 10000), exitBufferBps };
-  const quote: Port['quote'] = async (spot, buy, size) => {
+  const quote: Port['quote'] = async (spot, buy, size, purpose: QuotePurpose = 'entry') => {
     const coin = spot ? market.spotCoin : 'HYPE';
     const book = await info.l2Book({ coin });
     if (!book || book.coin !== coin || !Number.isFinite(book.time) ||
       Date.now() - book.time > 3000 || book.time > Date.now() + 1000) throw new BotError('Stale or invalid book');
-    const bid = vwap(book.levels[0], Math.min(size, 1e-8), 'sell');
-    const ask = vwap(book.levels[1], Math.min(size, 1e-8), 'buy');
-    if (bid >= ask) throw new BotError('Crossed book');
-    const average = vwap(book.levels[buy ? 1 : 0], size, buy ? 'buy' : 'sell');
-    const limit = limitPrice((buy ? ask : bid) * (1 + (buy ? 1 : -1) * slippageBps / 10000),
+    let bid: number, ask: number;
+    try { bid = touch(book.levels[0], 'sell'); ask = touch(book.levels[1], 'buy'); }
+    catch (error) { throw new BotError(error instanceof Error ? error.message : 'Invalid book'); }
+    if (!(bid > 0) || !(ask > 0) || bid >= ask) throw new BotError('Crossed book');
+    const slippage = purpose === 'exit' ? exitSlippageBps : slippageBps;
+    const limit = limitPrice((buy ? ask : bid) * (1 + (buy ? 1 : -1) * slippage / 10000),
       spot ? market.spotDecimals : market.perpDecimals, spot, buy);
-    // Reject orders whose displayed depth extends past the slippage limit.
-    const available = book.levels[buy ? 1 : 0].filter(l => buy ? n(l.px) <= n(limit) : n(l.px) >= n(limit));
-    vwap(available, size, buy ? 'buy' : 'sell');
+    const limitN = n(limit);
+    const eligible = book.levels[buy ? 1 : 0].filter(l => buy ? n(l.px) <= limitN : n(l.px) >= limitN);
+    let average: number;
+    try { average = vwap(eligible, size, buy ? 'buy' : 'sell'); }
+    catch (error) {
+      // Entry refuses to cross a book that cannot fill inside the slippage cap.
+      // Exit still sends the capped IOC: a thin book should not trap the position.
+      if (purpose === 'entry') throw new BotError(error instanceof Error ? error.message : 'Insufficient displayed depth');
+      const shown = eligible.reduce((sum, level) => sum + n(level.sz), 0);
+      if (!(shown > 0)) throw new BotError('Insufficient displayed depth');
+      average = vwap(eligible, Math.min(size, shown), buy ? 'buy' : 'sell');
+    }
     return { vwap: average, limit, at: book.time };
   };
   const snapshot: Port['snapshot'] = async () => {
     const [spot, perp, orders] = await Promise.all([info.spotClearinghouseState({ user: address }),
-      info.clearinghouseState({ user: address }), info.openOrders({ user: address })]);
+      info.clearinghouseState({ user: address }), info.frontendOpenOrders({ user: address })]);
+    if (spot.portfolioMarginEnabled) throw new BotError('Portfolio margin accounts are not supported');
     if (Date.now() - perp.time > 10000 || perp.time > Date.now() + 1000) throw new BotError('Stale account snapshot');
     const balance = spot.balances.find(b => 'token' in b && b.token === token.index);
     const cash = spot.balances.find(b => 'token' in b && b.token === pair.tokens[1]);
@@ -90,20 +108,36 @@ async function main() {
     const spotFree = total - (balance ? n(balance.hold) : 0);
     const perpSize = position ? n(position.szi) : 0;
     const mark = position && perpSize !== 0 ? n(position.positionValue) / Math.abs(perpSize) : 0;
-    // Account value already includes perp unrealized PnL and settled funding.
-    const s: Snapshot = { spot: total, spotFree, cash: cash ? n(cash.total) - n(cash.hold) : 0,
-      perp: perpSize, equity: n(perp.marginSummary.accountValue) + (cash ? n(cash.total) : 0),
-      marginFree: n(perp.withdrawable), perpMark: mark, openOrders: orders.length,
+    const liquidationPx = position?.liquidationPx ? n(position.liquidationPx) : null;
+    const spotUsdc = cash ? n(cash.total) : 0;
+    const perpEquity = n(perp.marginSummary.accountValue);
+    // Spot HYPE is marked by the caller. A stale book cannot block a balance read.
+    const s: Snapshot = { spot: total, spotFree, cash: cash ? spotUsdc - n(cash.hold) : 0, spotUsdc,
+      perp: perpSize, perpEquity, equity: perpEquity + spotUsdc, marginFree: n(perp.withdrawable),
+      perpMark: mark, liquidationPx, openOrders: orders.length,
       otherPositions: perp.assetPositions.some(p => p.position.coin !== 'HYPE' && n(p.position.szi) !== 0) ||
         spot.balances.some(b => (!('token' in b) || (b.token !== token.index && b.token !== pair.tokens[1])) && n(b.total) !== 0) };
-    // Spot liquidation value is included when inventory exists.
-    if (total > 0) s.equity += total * (await quote(true, false, Math.max(down(total, market.spotDecimals), 1e-8))).vwap;
     requireSnapshot(s); return s;
   };
+  let builderCheckedAt = 0;
+  const assertNoBuilderDexExposure = async (force = false) => {
+    if (!force && Date.now() - builderCheckedAt < 60_000) return;
+    const names = (await info.perpDexs()).flatMap(dex => dex?.name ? [dex.name] : []);
+    const exposed = await Promise.all(names.map(async name => {
+      const [state, orders] = await Promise.all([
+        info.clearinghouseState({ user: address, dex: name }),
+        info.frontendOpenOrders({ user: address, dex: name })]);
+      return orders.length > 0 || state.assetPositions.some(p => n(p.position.szi) !== 0);
+    }));
+    builderCheckedAt = Date.now();
+    if (exposed.some(Boolean)) throw new BotError('Dedicated account required: builder-dex positions or orders');
+  };
   console.log(JSON.stringify({ network, account: address, asset: 'HYPE', market, notional, maxNotional,
-    costs, slippageBps, stopLoss, maxHoldSeconds: maxHold / 1000 }));
+    costs, slippageBps, exitSlippageBps, liqBufferBps, stopLoss, maxHoldSeconds: maxHold / 1000 }));
   if (command === '--check') {
-    console.log(JSON.stringify({ check: await snapshot(), trading: 'disabled; no orders submitted' })); return;
+    const check = await snapshot();
+    await assertNoBuilderDexExposure(true);
+    console.log(JSON.stringify({ check, builderDexes: 'clear', trading: 'disabled; no orders submitted' })); return;
   }
   const key = process.env.AGENT_PRIVATE_KEY;
   if (!key || !/^0x[0-9a-fA-F]{64}$/.test(key)) throw new BotError('Set AGENT_PRIVATE_KEY locally; never share it in chat');
@@ -168,40 +202,65 @@ async function main() {
     process.once('SIGINT', () => { stop = true; });
     process.once('SIGTERM', () => { stop = true; });
     const isClosed = () => engine.state.phase === 'closed';
+    let failures = 0;
     while (!isClosed()) {
-      if (state.phase === 'flat') {
-        if (stop) return;
-        const spot = await info.l2Book({ coin: market.spotCoin });
-        if (!spot || !spot.levels[1][0]) throw new BotError('Empty spot book');
-        const ceiling = n(spot.levels[1][0].px) * (1 + slippageBps / 10000);
-        const size = down(notional / ceiling, sharedDecimals);
-        if (size * ceiling < 11) throw new BotError('Increase notional: rounded trade below minimum buffer');
-        const [s, p] = await Promise.all([quote(true, true, size), quote(false, false, size)]);
-        const estimate = (n(p.limit) - n(s.limit)) / n(s.limit) * 10000 -
-          2 * (costs.spotFeeBps + costs.perpFeeBps * n(p.limit) / n(s.limit)) - exitBufferBps;
-        console.log(JSON.stringify({ phase: 'flat', conservativeNetBps: estimate }));
-        if (estimate >= minNetBps && !stop) {
-          const before = await snapshot();
-          if (before.spot !== 0 || before.perp !== 0) throw new BotError('Entry requires an empty dedicated account');
-          await exchange.updateLeverage({ asset: perpId, isCross: true, leverage: 1 });
-          await engine.enter(size, Math.min(notional, maxNotional), costs);
-        }
-      } else if (state.phase === 'open') {
-        const held = await snapshot();
-        if (held.perp >= 0 || Math.abs(held.spot + held.perp) > 10 ** -market.perpDecimals + 1e-8) {
-          engine.record('Exposure mismatch; unwind'); await engine.close(); continue;
-        }
-        const q = Math.abs(held.perp);
-        const [s, p] = await Promise.all([quote(true, false, q), quote(false, true, q)]);
-        if (Math.abs(s.at - p.at) > 1500) throw new BotError('Exit book skew');
-        const closeBasisBps = (p.vwap - s.vwap) / s.vwap * 10000;
-        const estimatedCloseFees = held.spot * s.vwap * costs.spotFeeBps / 10000 + q * p.vwap * costs.perpFeeBps / 10000;
-        const estimatedPnl = held.equity + q * (held.perpMark - p.vwap) - estimatedCloseFees - state.entryEquity;
-        console.log(JSON.stringify({ phase: 'open', closeBasisBps, estimatedPnl, stop }));
-        if (stop || closeBasisBps <= exitBasisBps || estimatedPnl <= -stopLoss || Date.now() - state.startedAt >= maxHold)
-          await engine.close();
-      } else break;
-      if (!isClosed()) await new Promise(resolve => setTimeout(resolve, poll));
+      try {
+        if (state.phase === 'flat') {
+          if (stop) return;
+          const spotBook = await info.l2Book({ coin: market.spotCoin });
+          if (!spotBook || spotBook.coin !== market.spotCoin || !Number.isFinite(spotBook.time) ||
+            Date.now() - spotBook.time > 3000 || spotBook.time > Date.now() + 1000)
+            throw new BotError('Stale or invalid book');
+          let bestAsk: number;
+          try { bestAsk = touch(spotBook.levels[1], 'buy'); }
+          catch (error) { throw new BotError(error instanceof Error ? error.message : 'Invalid book'); }
+          const ceiling = bestAsk * (1 + slippageBps / 10000);
+          const size = down(notional / ceiling, sharedDecimals);
+          if (size * ceiling < 11) throw new BotError('Increase notional: rounded trade below minimum buffer');
+          const [s, p] = await Promise.all([quote(true, true, size, 'entry'), quote(false, false, size, 'entry')]);
+          const estimate = conservativeNetBps(n(s.limit), n(p.limit), costs);
+          console.log(JSON.stringify({ phase: 'flat', conservativeNetBps: estimate }));
+          if (estimate >= minNetBps && !stop) {
+            const before = await snapshot();
+            if (before.spot !== 0 || before.perp !== 0) throw new BotError('Entry requires an empty dedicated account');
+            await assertNoBuilderDexExposure(true);
+            await exchange.updateLeverage({ asset: perpId, isCross: true, leverage: 1 });
+            const active = await info.activeAssetData({ user: address, coin: 'HYPE' });
+            if (active.leverage.type !== 'cross' || active.leverage.value !== 1)
+              throw new BotError('HYPE leverage is not 1x cross');
+            await engine.enter(size, Math.min(notional, maxNotional), costs);
+          }
+        } else if (state.phase === 'open') {
+          await assertNoBuilderDexExposure();
+          const held = await snapshot();
+          if (held.perp >= 0 || Math.abs(held.spot + held.perp) > 10 ** -market.perpDecimals + 1e-8) {
+            engine.record('Exposure mismatch; unwind'); await engine.close(); continue;
+          }
+          const q = Math.abs(held.perp);
+          const [s, p] = await Promise.all([quote(true, false, q, 'exit'), quote(false, true, q, 'exit')]);
+          if (Math.abs(s.at - p.at) > 1500) throw new BotError('Exit book skew');
+          const closeBasisBps = (p.vwap - s.vwap) / s.vwap * 10000;
+          // Quotes already ignore prices beyond the exit limit, so this VWAP is a fill the IOC can reach.
+          const estimatedPnl = closePnl({ perpEquity: held.perpEquity, spotUsdc: held.spotUsdc, spotQty: held.spot,
+            spotExitPx: s.vwap, perpQty: q, perpMark: held.perpMark, perpExitPx: p.vwap,
+            spotFeeBps: costs.spotFeeBps, perpFeeBps: costs.perpFeeBps, entryEquity: state.entryEquity });
+          const reason = exitReason({ stopRequested: stop, closeBasisBps, exitBasisBps, estimatedPnl, stopLoss,
+            heldMs: Date.now() - state.startedAt, maxHoldMs: maxHold,
+            liquidationDistanceBps: liquidationDistanceBps(held.perpMark, held.liquidationPx), liqBufferBps });
+          console.log(JSON.stringify({ phase: 'open', closeBasisBps, estimatedPnl, liquidationPx: held.liquidationPx, reason, stop }));
+          if (reason) await engine.close();
+        } else throw new BotError(`Cannot resume phase ${state.phase}`);
+        failures = 0;
+        if (!isClosed()) await new Promise(resolve => setTimeout(resolve, poll));
+      } catch (error) {
+        if (mustHaltAfterError(engine.state) || !retryableReadError(error)) throw error;
+        failures += 1;
+        const wait = Math.min(60_000, poll * Math.min(failures, 8));
+        console.error(JSON.stringify({ at: new Date().toISOString(), retryInMs: wait,
+          error: error instanceof BotError ? error.message : 'Read failed; will retry' }));
+        if (stop && engine.state.phase === 'flat') return;
+        await new Promise(resolve => setTimeout(resolve, wait));
+      }
     }
   } finally { closeSync(lockFd); unlinkSync(lock); }
 }

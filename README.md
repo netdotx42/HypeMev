@@ -20,7 +20,7 @@ ASSET=HYPE NOTIONAL_USDC=100 MIN_NET_BPS=20 SPOT_FEE_BPS=10 PERP_FEE_BPS=5 EXIT_
 
 Fees are illustrative assumptions, not verified account fees. Set them to your actual taker rates. NOTIONAL_USDC limits the spot purchase before fees; additional cash for fees and perpetual margin is required for any eventual trading implementation.
 
-The scanner discovers a matching USDC spot pair from spotMeta and the native perpetual from meta, uses l2Book depth to estimate executable VWAPs, rounds quantity down to shared size precision, and rejects stale/skewed books. Only long-spot/short-perpetual candidates are considered; no spot borrowing is assumed. Check the underlying asset identity before changing ASSET; equal symbols alone do not prove economic equivalence.
+The scanner discovers a matching USDC spot pair from spotMeta and the native perpetual from meta, uses l2Book depth to estimate executable VWAPs, sizes from the best ask rather than the first displayed level, rounds quantity down to shared size precision, and rejects stale/skewed books. Only long-spot/short-perpetual candidates are considered; no spot borrowing is assumed. Check the underlying asset identity before changing ASSET; equal symbols alone do not prove economic equivalence.
 
 Estimated convergence PnL = quantity × (perp sell VWAP − spot buy VWAP) − estimated entry and exit fees − exit buffer. The calculation assumes the basis eventually closes to zero. It excludes funding, borrow costs, collateral opportunity cost, liquidation, changing prices and partial fills. Repeated output lines are independent quotes, not cumulative PnL or paper fills. Funding may help or hurt. Exit fees are approximated using entry notionals.
 
